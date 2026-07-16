@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="text-2xl font-bold mb-4">First-run setup</h1>
+
+<section class="bg-white rounded shadow p-4 mb-6">
+  <h2 class="font-semibold mb-2">1. Spotify</h2>
+  <p class="text-sm text-slate-700 mb-2">
+    Create a Spotify app at
+    <a class="underline" href="https://developer.spotify.com/dashboard">developer.spotify.com/dashboard</a>,
+    set the redirect URI to
+    <code class="bg-slate-100 px-1">http://localhost:8000/callback/spotify</code>,
+    then put the client id / secret into your <code>.env</code>.
+  </p>
+  <p>Status: <b class="{% if spotify_ok %}text-emerald-600{% else %}text-rose-600{% endif %}">{{ "OK" if spotify_ok else "Not configured" }}</b></p>
+  {% if not spotify_ok %}
+    <form action="/auth/spotify" method="get" class="mt-2">
+      <button class="bg-emerald-600 text-white px-3 py-1 rounded">Run Spotify OAuth</button>
+    </form>
+  {% endif %}
+</section>
+
+<section class="bg-white rounded shadow p-4">
+  <h2 class="font-semibold mb-2">2. YouTube Music</h2>
+  <p class="text-sm text-slate-700 mb-2">
+    Open <a class="underline" href="https://music.youtube.com">music.youtube.com</a>,
+    open DevTools (F12) → Network → click any request → right-click →
+    <b>Copy → Copy as cURL (bash)</b>. Paste the headers below into the
+    form (the minimum keys are <code>cookie</code> and <code>x-goog-authuser</code>).
+  </p>
+  <p>Status: <b class="{% if ytm_ok %}text-emerald-600{% else %}text-rose-600{% endif %}">{{ "OK" if ytm_ok else "Not configured" }}</b></p>
+  <form action="/auth/ytm/upload" method="post" enctype="multipart/form-data" class="mt-2 flex gap-2">
+    <input type="file" name="file" accept=".json" class="text-sm" required />
+    <button class="bg-sky-600 text-white px-3 py-1 rounded">Upload headers</button>
+  </form>
+</section>
+{% endblock %}

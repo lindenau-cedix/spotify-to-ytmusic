@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="text-2xl font-bold mb-2">Review queue</h1>
+<div class="text-sm text-slate-600 mb-4">
+  Playlist: <b>{{ playlist.name }}</b> ({{ playlist.track_count }} tracks).
+  Filter:
+  <a class="underline" href="?playlist={{ playlist.playlist_id }}&status=review">review</a> ·
+  <a class="underline" href="?playlist={{ playlist.playlist_id }}&status=accepted">accepted</a> ·
+  <a class="underline" href="?playlist={{ playlist.playlist_id }}&status=skipped">skipped</a> ·
+  <a class="underline" href="?playlist={{ playlist.playlist_id }}&status=all">all</a>
+</div>
+
+<form hx-post="/review/{{ playlist.playlist_id }}/bulk-accept"
+      hx-target="#bulk-result" hx-swap="innerHTML" class="mb-4 flex items-center gap-2 text-sm">
+  Bulk accept all review rows scoring ≥
+  <input type="number" step="0.05" name="threshold" value="0.85" class="border px-2 py-1 w-20 rounded" />
+  <button class="bg-emerald-600 text-white px-3 py-1 rounded">Apply</button>
+  <span id="bulk-result"></span>
+</form>
+
+<table class="w-full text-sm bg-white rounded shadow">
+  <thead class="bg-slate-100">
+    <tr>
+      <th class="text-left p-2">#</th>
+      <th class="text-left p-2">Spotify track</th>
+      <th class="text-left p-2">Status</th>
+      <th class="text-left p-2">Candidates</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr class="border-t align-top" id="row-{{ r.spotify_track_id }}">
+      <td class="p-2 text-slate-500">{{ r.position }}</td>
+      <td class="p-2">
+        <div class="font-medium">{{ r.title }}</div>
+        <div class="text-xs text-slate-500">{{ r.artists|join(", ") }} — {{ r.album }}</div>
+        <div class="text-xs text-slate-400">{{ (r.duration_ms/1000)|round(1) }}s · ISRC {{ r.isrc or "—" }}</div>
+        <a class="text-xs text-indigo-600 underline" href="{{ r.spotify_url }}" target="_blank">Spotify ↗</a>
+      </td>
+      <td class="p-2">
+        <span class="pill bg-slate-200">{{ r.status }}</span>
+        <span class="pill bg-slate-100">score {{ r.score }}</span>
+        {% if r.chosen_video_id %}
+          <div class="text-xs mt-1">→ {{ r.chosen_title }}</div>
+        {% endif %}
+      </td>
+      <td class="p-2">
+        {% for c in r.candidates[:5] %}
+          <div class="border rounded p-2 mb-1 text-xs">
+            <div><b>{{ c.title }}</b> — {{ c.artists|map(attribute='name')|join(', ') }}</div>
+            <div class="text-slate-500">videoId={{ c.videoId }} · dur={{ c.duration or c.duration_seconds }}</div>
+            <form hx-post="/review/{{ playlist.playlist_id }}/{{ r.spotify_track_id }}/accept"
+                  hx-target="#row-{{ r.spotify_track_id }}" hx-swap="outerHTML" class="mt-1">
+              <input type="hidden" name="video_id" value="{{ c.videoId }}" />
+              <input type="hidden" name="video_title" value="{{ c.title }}" />
+              <input type="hidden" name="video_artists"
+                     value="{{ c.artists|map(attribute='name')|join(',') }}" />
+              <input type="hidden" name="video_duration_ms" value="0" />
+              <button class="text-emerald-700 hover:underline">Use this</button>
+            </form>
+          </div>
+        {% endfor %}
+        <form hx-post="/review/{{ playlist.playlist_id }}/{{ r.spotify_track_id }}/search"
+              hx-target="#search-{{ r.spotify_track_id }}" hx-swap="innerHTML" class="mt-1">
+          <input name="query" placeholder="search YTM…" class="border px-2 py-0.5 rounded text-xs" />
+        </form>
+        <div id="search-{{ r.spotify_track_id }}" class="text-xs"></div>
+      </td>
+      <td class="p-2 space-y-1">
+        <form hx-post="/review/{{ playlist.playlist_id }}/{{ r.spotify_track_id }}/skip"
+              hx-target="#row-{{ r.spotify_track_id }}" hx-swap="outerHTML">
+          <button class="text-rose-600 hover:underline">No match</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if not rows %}
+  <p class="text-slate-500">No rows match this filter.</p>
+{% endif %}
+{% endblock %}

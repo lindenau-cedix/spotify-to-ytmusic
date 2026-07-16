@@ -1,0 +1,33 @@
+{
+  "_doc": "No match: nothing in YTM is even close. Status should be 'skipped'.",
+  "spotify": {
+    "track_id": "spotify:track:ZZZnosuchtrack",
+    "name": "Asdfghjkl Qwertyuiop",
+    "artists": ["Nobody Famous"],
+    "album": "Imaginary LP",
+    "duration_ms": 123000,
+    "isrc": "ZZZ999999999",
+    "spotify_url": "https://open.spotify.com/track/ZZZnosuchtrack"
+  },
+  "ytm_candidates": [
+    {
+      "videoId": "WRONG000001",
+      "title": "Hotel California",
+      "artists": [{"name": "Eagles"}],
+      "duration": "6:30",
+      "duration_seconds": 390.0
+    },
+    {
+      "videoId": "WRONG000002",
+      "title": "Stairway to Heaven",
+      "artists": [{"name": "Led Zeppelin"}],
+      "duration": "8:02",
+      "duration_seconds": 482.0
+    }
+  ],
+  "expected": {
+    "chosen_video_id": null,
+    "score_lt": 0.4,
+    "status": "skipped"
+  }
+}

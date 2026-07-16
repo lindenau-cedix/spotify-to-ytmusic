@@ -1,0 +1,28 @@
+# Non-secret settings. Override per-machine by copying to config.local.toml
+# (which is gitignored). Secrets live in .env.
+
+[data]
+data_dir = ".migrator"
+db_path = ".migrator/migrator.db"
+
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[matching]
+concurrency = 4
+threshold_accept = 0.7
+threshold_review = 0.4
+duration_tolerance_strict_seconds = 3
+duration_tolerance_loose_seconds = 10
+search_top_k = 5
+
+[importing]
+batch_size = 50
+rate_limit_backoff_seconds = 30
+rate_limit_max_retries = 3
+default_privacy = "PRIVATE"
+
+[logging]
+level = "INFO"
+json_path = "logs/migrator.log"

@@ -1,0 +1,33 @@
+{
+  "_doc": "Fuzzy match: candidate has same title + artist but duration is off by 8s (loose tolerance, not strict). No exact-title bonus because of trailing ' - Edit'. Lands in 'review' tier (0.4-0.7).",
+  "spotify": {
+    "track_id": "spotify:track:2nGFzvICaeEWjIrBrL2RAx",
+    "name": "Clair de Lune",
+    "artists": ["Claude Debussy"],
+    "album": "Suite Bergamasque",
+    "duration_ms": 300000,
+    "isrc": "",
+    "spotify_url": "https://open.spotify.com/track/2nGFzvICaeEWjIrBrL2RAx"
+  },
+  "ytm_candidates": [
+    {
+      "videoId": "ZZZZZZZZZZ",
+      "title": "Clair de Lune - Edit",
+      "artists": [{"name": "Claude Debussy"}],
+      "duration": "5:08",
+      "duration_seconds": 308.0
+    },
+    {
+      "videoId": "WRONG00001",
+      "title": "Random Pop Song",
+      "artists": [{"name": "Various Artists"}],
+      "duration": "3:30",
+      "duration_seconds": 210.0
+    }
+  ],
+  "expected": {
+    "chosen_video_id": "ZZZZZZZZZZ",
+    "score_between": [0.4, 0.7],
+    "status": "review"
+  }
+}

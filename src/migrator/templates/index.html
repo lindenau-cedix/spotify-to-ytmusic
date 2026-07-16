@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="text-2xl font-bold mb-4">Dashboard</h1>
+
+{% if not spotify_ok or not ytm_ok %}
+  <div class="bg-amber-100 border border-amber-300 text-amber-900 rounded p-4 mb-6">
+    Auth not complete.
+    <a class="underline ml-2" href="/setup">Set up →</a>
+  </div>
+{% endif %}
+
+<section class="grid grid-cols-2 gap-4 mb-8">
+  <div class="bg-white rounded shadow p-4">
+    <div class="text-sm text-slate-500">Spotify</div>
+    <div class="text-lg font-semibold {% if spotify_ok %}text-emerald-600{% else %}text-rose-600{% endif %}">
+      {{ "OK" if spotify_ok else "Not configured" }}
+    </div>
+  </div>
+  <div class="bg-white rounded shadow p-4">
+    <div class="text-sm text-slate-500">YouTube Music</div>
+    <div class="text-lg font-semibold {% if ytm_ok %}text-emerald-600{% else %}text-rose-600{% endif %}">
+      {{ "OK" if ytm_ok else "Not configured" }}
+    </div>
+  </div>
+</section>
+
+<h2 class="text-lg font-semibold mb-2">Playlists ({{ playlists|length }})</h2>
+{% if playlists %}
+<table class="w-full text-sm bg-white rounded shadow">
+  <thead class="bg-slate-100">
+    <tr><th class="text-left p-2">Name</th><th class="text-right p-2">Tracks</th><th class="text-left p-2">YTM</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for p in playlists %}
+    <tr class="border-t">
+      <td class="p-2">{{ p.name }}</td>
+      <td class="p-2 text-right">{{ p.track_count }}</td>
+      <td class="p-2">{{ p.ytm_playlist_id or "—" }}</td>
+      <td class="p-2 space-x-2">
+        <a class="text-indigo-600 hover:underline" href="/review?playlist={{ p.playlist_id }}">Review</a>
+        <form hx-post="/playlists/{{ p.playlist_id }}/run-matching" hx-swap="none" class="inline">
+          <button class="text-sky-600 hover:underline">Re-match</button>
+        </form>
+        <form hx-post="/playlists/{{ p.playlist_id }}/import" hx-swap="none" class="inline">
+          <button class="text-emerald-600 hover:underline">Import</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="text-slate-500">No exported playlists yet. Run
+  <code class="bg-slate-200 px-1 rounded">python -m migrator export</code>.</p>
+{% endif %}
+{% endblock %}

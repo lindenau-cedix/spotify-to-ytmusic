@@ -1,0 +1,35 @@
+{
+  "_doc": "Perfect match: Spotify track has ISRC, YTM returns the same recording with identical title, artist, and duration.",
+  "spotify": {
+    "track_id": "spotify:track:6rqhFgbbKwnb9MLmUQDhG6",
+    "name": "Bohemian Rhapsody",
+    "artists": ["Queen"],
+    "album": "A Night at the Opera",
+    "duration_ms": 354947,
+    "isrc": "GBUM71029604",
+    "spotify_url": "https://open.spotify.com/track/6rqhFgbbKwnb9MLmUQDhG6"
+  },
+  "ytm_candidates": [
+    {
+      "videoId": "fJ9rUzIMcZQ",
+      "title": "Bohemian Rhapsody - Remastered 2011",
+      "artists": [{"name": "Queen"}],
+      "album": {"name": "A Night At The Opera"},
+      "duration": "5:55",
+      "duration_seconds": 355.7,
+      "isExplicit": false
+    },
+    {
+      "videoId": "AAAAAAAAAA",
+      "title": "Bohemian Rhapsody (Instrumental)",
+      "artists": [{"name": "The Guitar Crew"}],
+      "duration": "5:55",
+      "duration_seconds": 355.0
+    }
+  ],
+  "expected": {
+    "chosen_video_id": "fJ9rUzIMcZQ",
+    "score_gte": 0.7,
+    "status": "accepted"
+  }
+}
