@@ -8,7 +8,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -95,6 +95,25 @@ def _version_callback(value: bool) -> None:
     if value:
         console.print(f"spotify-to-ytmusic {__version__}")
         raise typer.Exit()
+
+
+def _print_batch_summary(
+    verb_past: str, succeeded: list[str], failed: list[tuple[str, str]]
+) -> None:
+    """Print a one-line batch summary and exit non-zero if anything failed.
+
+    `verb_past` is e.g. "matched", "imported", "migrated" — the past-tense
+    form used in the success line. Failures are printed individually so the
+    user can re-run the failed IDs by hand.
+    """
+    console.print(
+        f"\n[bold]Batch summary:[/bold] {len(succeeded)} {verb_past}, "
+        f"{len(failed)} failed"
+    )
+    for pid, reason in failed:
+        console.print(f"  [red]FAIL[/red] {pid}: {reason}")
+    if failed:
+        raise typer.Exit(1)
 
 
 @app.callback(invoke_without_command=True)
@@ -257,17 +276,44 @@ def export(
 
 @app.command()
 def match(
-    playlist_id: str = typer.Argument(...),
+    playlist_id: Optional[str] = typer.Argument(
+        None, help="One playlist ID, or omit to match every exported playlist."
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
-    """Run matching for a previously-exported playlist."""
+    """Run matching for one — or every — previously-exported playlist."""
     setup_logging()
     if not auth_ok("ytm"):
         console.print("[red]YTM not authenticated.[/red]")
         raise typer.Exit(1)
     ytm = ensure_ytm_client(dry_run=dry_run)
     matcher = Matcher(ytm)
-    _run_matching(matcher, playlist_id, dry_run=dry_run)
+    if playlist_id is not None:
+        _run_matching(matcher, playlist_id, dry_run=dry_run)
+        return
+
+    pls = list_playlists()
+    if not pls:
+        console.print("[yellow]No exported playlists. Run `export` first.[/yellow]")
+        raise typer.Exit(1)
+    console.print(f"Matching {len(pls)} playlists …")
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for p in pls:
+        console.print(f"\n[bold]== {p.name}[/bold]  ({p.playlist_id})")
+        try:
+            _run_matching(matcher, p.playlist_id, dry_run=dry_run)
+            succeeded.append(p.playlist_id)
+        except typer.Exit as e:
+            # Honor intentional exits (e.g. "no tracks in DB"); not a failure.
+            if e.code in (None, 0):
+                succeeded.append(p.playlist_id)
+            else:
+                failed.append((p.playlist_id, f"exit code {e.code}"))
+        except Exception as e:  # noqa: BLE001
+            log.exception("matching failed", extra={"playlist_id": p.playlist_id})
+            failed.append((p.playlist_id, str(e)))
+    _print_batch_summary("matched", succeeded, failed)
 
 
 def _run_matching(matcher: Matcher, playlist_id: str, *, dry_run: bool) -> None:
@@ -320,16 +366,114 @@ def _run_matching(matcher: Matcher, playlist_id: str, *, dry_run: bool) -> None:
 
 @app.command(name="import")
 def import_cmd(  # `import` is a Python keyword; registered under explicit name
-    playlist_id: str = typer.Argument(...),
+    playlist_id: Optional[str] = typer.Argument(
+        None, help="One playlist ID, or omit to import every exported playlist."
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ) -> None:
-    """Push the approved matching rows to a new YTM playlist."""
+    """Push approved matches to YTM — for one playlist or every exported one."""
     setup_logging()
     if not auth_ok("ytm"):
         console.print("[red]YTM not authenticated.[/red]")
         raise typer.Exit(1)
 
+    # Single-playlist path: keep the existing semantics intact so web.py's
+    # /playlists/{id}/import endpoint (which calls this with a non-None id)
+    # is byte-identical to before.
+    if playlist_id is not None:
+        ytm = ensure_ytm_client(dry_run=dry_run)
+        _import_one(ytm, playlist_id, dry_run=dry_run, yes_assumed=yes)
+        return
+
+    # Batch path.
+    pls = list_playlists()
+    if not pls:
+        console.print("[yellow]No exported playlists. Run `export` first.[/yellow]")
+        raise typer.Exit(1)
+
+    plan = _plan_batch_imports(pls, dry_run=dry_run)
+    if not plan["to_process"]:
+        console.print("[yellow]Nothing to import across all playlists.[/yellow]")
+        raise typer.Exit(0)
+
+    if not yes and not dry_run and plan["n_new"] > 0:
+        confirm = typer.confirm(
+            f"Create {plan['n_new']} new YTM playlists "
+            f"with {plan['total_tracks']} total tracks?",
+            default=True,
+        )
+        if not confirm:
+            raise typer.Abort()
+
+    ytm = ensure_ytm_client(dry_run=dry_run)
+    console.print(f"Importing {len(plan['to_process'])} playlists …")
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for pid in plan["to_process"]:
+        pl = next(p for p in pls if p.playlist_id == pid)
+        console.print(f"\n[bold]== {pl.name}[/bold]  ({pid})")
+        try:
+            _import_one(ytm, pid, dry_run=dry_run, yes_assumed=True)
+            succeeded.append(pid)
+        except typer.Exit as e:
+            if e.code in (None, 0):
+                succeeded.append(pid)
+            else:
+                failed.append((pid, f"exit code {e.code}"))
+        except Exception as e:  # noqa: BLE001
+            log.exception("import failed", extra={"playlist_id": pid})
+            failed.append((pid, str(e)))
+    _print_batch_summary("imported", succeeded, failed)
+
+
+def _plan_batch_imports(
+    pls: list[Playlists], *, dry_run: bool
+) -> dict[str, Any]:
+    """Decide which playlists actually have work to do, and tally new-playlist cost."""
+    from sqlmodel import Session, select
+
+    from .db import Matches, Tracks as T, get_engine
+
+    engine = get_engine()
+    to_process: list[str] = []
+    n_new = 0
+    total_tracks = 0
+    for p in pls:
+        with Session(engine) as s:
+            pl = s.get(Playlists, p.playlist_id)
+            if pl is None:
+                continue
+            rows = s.exec(
+                select(Matches, T)
+                .join(
+                    T,
+                    (T.playlist_id == Matches.playlist_id)
+                    & (T.snapshot_id == Matches.snapshot_id)
+                    & (T.spotify_track_id == Matches.spotify_track_id),
+                )
+                .where(Matches.playlist_id == p.playlist_id)
+                .where(Matches.snapshot_id == pl.snapshot_id)
+                .where(Matches.status.in_(["accepted", "manual_accepted"]))
+            ).all()
+        chosen = [m for m, _ in rows if m.chosen_video_id]
+        if not chosen:
+            continue
+        to_process.append(p.playlist_id)
+        if not pl.ytm_playlist_id:
+            n_new += 1
+            total_tracks += len(chosen)
+    return {"to_process": to_process, "n_new": n_new, "total_tracks": total_tracks}
+
+
+def _import_one(
+    ytm: YTMClient, playlist_id: str, *, dry_run: bool, yes_assumed: bool
+) -> None:
+    """Per-playlist import. Raises typer.Exit on expected skip conditions.
+
+    `yes_assumed=True` means we've already obtained user consent for any
+    new-playlist creation upstream, so skip the per-call confirm prompt.
+    """
     from sqlmodel import Session, select
 
     from .db import ImportedTracks, Matches, Tracks as T, get_engine
@@ -369,14 +513,12 @@ def import_cmd(  # `import` is a Python keyword; registered under explicit name
     if ytm_pid:
         console.print(f"Resuming into existing YTM playlist [bold]{ytm_pid}[/bold] ({len(already)} already imported)")
     else:
-        if not yes and not dry_run:
+        if not yes_assumed and not dry_run:
             confirm = typer.confirm(
                 f"Create new YTM playlist '{pl.name}' with {len(chosen)} tracks?", default=True
             )
             if not confirm:
                 raise typer.Abort()
-
-    ytm = ensure_ytm_client(dry_run=dry_run)
 
     if not ytm_pid:
         ytm_pid = ytm.create_playlist(
@@ -424,10 +566,16 @@ def import_cmd(  # `import` is a Python keyword; registered under explicit name
 
 @app.command()
 def run(
-    playlist_id: str = typer.Argument(...),
+    playlist_id: Optional[str] = typer.Argument(
+        None, help="One playlist ID, or omit to run the full pipeline over every playlist."
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
-    """End-to-end: export → match → (review) → import. Skips review queue."""
+    """End-to-end: export → match → (review) → import. Skips review queue.
+
+    With no playlist_id, exports every Spotify playlist, then matches + imports
+    each one in turn. Per-playlist failures are logged and the batch continues.
+    """
     setup_logging()
     if not auth_ok("spotify"):
         console.print("[red]Spotify not authenticated.[/red]")
@@ -436,11 +584,45 @@ def run(
         console.print("[red]YTM not authenticated.[/red]")
         raise typer.Exit(1)
 
+    # Step 1: export (already iterates all Spotify playlists when playlist_id is None).
     export(playlist_id=playlist_id, dry_run=dry_run)
+
+    # Step 2: match + import. Single-playlist path keeps the original behavior
+    # (review-queue abort, single-shot summary). Batch path continues past errors.
+    pls = [playlist_id] if playlist_id is not None else [p.playlist_id for p in list_playlists()]
+    if not pls:
+        console.print("[yellow]No playlists to process.[/yellow]")
+        raise typer.Exit(0)
+
     ytm = ensure_ytm_client(dry_run=dry_run)
     matcher = Matcher(ytm)
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for pid in pls:
+        try:
+            _run_pipeline_for_one(matcher, pid, dry_run=dry_run)
+            succeeded.append(pid)
+        except typer.Exit as e:
+            if e.code in (None, 0):
+                succeeded.append(pid)
+            else:
+                failed.append((pid, f"exit code {e.code}"))
+        except Exception as e:  # noqa: BLE001
+            log.exception("pipeline failed", extra={"playlist_id": pid})
+            failed.append((pid, str(e)))
+    if playlist_id is not None:
+        return  # single-playlist mode preserves the original exit codes
+    _print_batch_summary("migrated", succeeded, failed)
+
+
+def _run_pipeline_for_one(matcher: Matcher, playlist_id: str, *, dry_run: bool) -> None:
+    """Run matching, then import (skipping on review rows) for one playlist.
+
+    Mirrors the original `run` body. On any review rows left, abort the
+    auto-import step so the user can resolve them in the UI first — but
+    treat that abort as a successful pipeline step (code 0).
+    """
     _run_matching(matcher, playlist_id, dry_run=dry_run)
-    # Only auto-import if there are no review rows left.
     from sqlmodel import Session, select
 
     from .db import Matches, get_engine

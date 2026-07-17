@@ -94,6 +94,25 @@ python -m migrator serve              # review UI on http://127.0.0.1:8000
 python -m migrator import <playlist_id>
 ```
 
+`export`, `match`, `import`, and `run` all accept an optional `playlist_id` —
+omit it to run the command over every exported playlist:
+
+```bash
+# Migrate everything (export + match + import across all playlists):
+python -m migrator run
+
+# Or step-by-step across all playlists:
+python -m migrator export                 # all Spotify playlists → DB
+python -m migrator match                  # match every exported playlist
+python -m migrator serve                  # resolve review rows in the UI
+python -m migrator import --yes           # push every accepted match to YTM
+```
+
+In batch mode the per-playlist failures are logged and the loop continues;
+the run exits non-zero if any playlist failed, so you can re-run to retry
+just the ones that errored out. `import` without `--yes` shows one summary
+prompt up front for the whole batch instead of per playlist.
+
 For a 200-track playlist you should expect:
 
 - ~80%+ auto-accepted (no manual work)
@@ -119,6 +138,10 @@ Every mutating command accepts `--dry-run`:
 ```bash
 python -m migrator run <playlist_id> --dry-run
 python -m migrator import <playlist_id> --dry-run
+
+# Dry-run the whole library at once:
+python -m migrator run --dry-run
+python -m migrator import --dry-run
 ```
 
 Dry runs print what would happen, including the planned YTM playlist name,

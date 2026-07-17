@@ -175,7 +175,10 @@ unblocked. The cap exists because YTM is rate-limited and aggressive
 concurrency gets you 429s faster.
 
 The CLI's `run` subcommand runs the whole pipeline synchronously: export →
-match → (skip review) → import. The web UI's `/playlists/{id}/run-matching`
+match → (skip review) → import. With no `playlist_id` it iterates over every
+Spotify playlist and continues past per-playlist failures, printing a summary
+at the end. The same batch behavior is available on `export`, `match`, and
+`import` by omitting the positional. The web UI's `/playlists/{id}/run-matching`
 runs the same matching call from FastAPI, and `/playlists/{id}/import` calls
 the same import function the CLI does.
 
