@@ -1,0 +1,2 @@
+[console_scripts]
+migrator = migrator.cli:app

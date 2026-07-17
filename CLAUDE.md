@@ -33,6 +33,8 @@ The venv at `.venv/` is the install location this session used (the system pip a
 
 `typer==0.15.1` is incompatible with `click>=8.2` — `Parameter.make_metavar() missing 'ctx'` on `--help`. Both `pyproject.toml` and `requirements.txt` pin `click>=8.0,<8.2`. If you bump typer, re-test `--help` immediately.
 
+`ytmusicapi` is pinned to `>=1.12.0` — versions before 1.12.0 hit `TypeError: RefreshingToken.__init__() got an unexpected keyword argument 'refresh_token_expires_in'` during the OAuth device flow because Google's token endpoint started returning that field. Don't downgrade without a fix for that.
+
 ## Architecture cheat sheet
 
 Five SQLite tables drive everything (see `docs/architecture.md` for the full schema):

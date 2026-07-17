@@ -143,11 +143,24 @@ class YTMClient:
             self._ytm = ytmusicapi.YTMusic(auth=self._headers)
         return self._ytm
 
-    def search_songs(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """Top N song results. Returns list of YTM dicts with videoId, title, …"""
+    def search_songs(self, query: str, limit: int = 5, *, debug: bool = False) -> list[dict[str, Any]]:
+        """Top N song results. Returns list of YTM dicts with videoId, title, …
+
+        On exception, logs at warning level (preserves the historical
+        silent-[] behaviour used by the matching pipeline) and returns [].
+        Pass ``debug=True`` to log at error level with the full traceback
+        and re-raise — useful when diagnosing auth or rate-limit issues.
+        """
         try:
             res = self.ytm.search(query, filter="songs", limit=limit)
         except Exception as e:  # noqa: BLE001
+            if debug:
+                log.error(
+                    "YTM search failed (debug mode — re-raising)",
+                    extra={"query": query, "err": str(e)},
+                    exc_info=True,
+                )
+                raise
             log.warning("YTM search failed", extra={"query": query, "err": str(e)})
             return []
         return list(res or [])
