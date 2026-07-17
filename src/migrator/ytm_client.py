@@ -88,7 +88,10 @@ def import_headers_from(src: Path) -> Path:
     if not src.exists():
         raise FileNotFoundError(f"Headers file not found: {src}")
     dest = settings.ytm_headers_path
-    shutil.copy2(src, dest)
+    # If the user already saved the file at the destination path, there is
+    # nothing to copy — copying a file onto itself raises SameFileError.
+    if not (dest.exists() and src.resolve() == dest.resolve()):
+        shutil.copy2(src, dest)
     # Validate so we surface errors immediately.
     load_headers(dest)
     upsert_auth("ytm", True, str(dest))
