@@ -210,11 +210,11 @@ def iter_playlist_tracks(
     """
     items: list[dict[str, Any]] = []
     snapshot_id = ""
-    # NOTE: no `fields=` mask — a tight mask combined with spotipy's default
-    # `additional_types=("track","episode")` makes Spotify return 403 on some
-    # user-owned playlists in Development Mode. The bandwidth saving isn't
-    # worth the brittleness; pull the full item and filter locally.
-    page = sp.playlist_items(playlist_id, limit=100)
+    # NOTE: no `fields=` mask AND restrict `additional_types` to track only.
+    # The default `additional_types=("track","episode")` makes Spotify return
+    # 403 on the `/tracks` endpoint for some user-owned playlists in
+    # Development Mode. We don't migrate episodes, so just ask for tracks.
+    page = sp.playlist_items(playlist_id, limit=100, additional_types=("track",))
     while True:
         snapshot_id = snapshot_id or (page.get("snapshot_id") or "")
         for it in page.get("items") or []:
