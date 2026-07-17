@@ -210,20 +210,20 @@ def iter_playlist_tracks(
     """
     items: list[dict[str, Any]] = []
     snapshot_id = ""
-    page = sp.playlist_items(
-        playlist_id,
-        limit=100,
-        fields="items(track(id,uri,name,artists(name),album(name),duration_ms,"
-        "external_ids,external_urls)),next,snapshot_id",
-    )
+    # NOTE: no `fields=` mask — a tight mask combined with spotipy's default
+    # `additional_types=("track","episode")` makes Spotify return 403 on some
+    # user-owned playlists in Development Mode. The bandwidth saving isn't
+    # worth the brittleness; pull the full item and filter locally.
+    page = sp.playlist_items(playlist_id, limit=100)
     while True:
         snapshot_id = snapshot_id or (page.get("snapshot_id") or "")
         for it in page.get("items") or []:
             track = it.get("track")
             if track is None:
                 continue
-            # Only songs; skip episodes / local files.
-            if track.get("is_local") or not track.get("id"):
+            # Local files have no id; episodes don't either. Either way they
+            # can't be looked up on YTM, so drop them.
+            if not track.get("id"):
                 continue
             items.append(track)
         if page.get("next"):
