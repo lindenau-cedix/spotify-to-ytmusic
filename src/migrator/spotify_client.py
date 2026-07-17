@@ -47,11 +47,15 @@ class KeyringCacheHandler(CacheHandler):
         rt = load_secret(REFRESH_TOKEN_ACCOUNT)
         if not rt:
             return None
+        # `access_token` is empty by design — we don't store it. Mark the
+        # token as already expired so spotipy triggers a refresh on the
+        # first API call instead of trying to use the empty bearer.
         return {
             "access_token": "",
             "token_type": "Bearer",
             "expires_in": 3600,
-            "expires_at": int(time.time()) + 3600,
+            # 1 second in the past — definitely expired.
+            "expires_at": int(time.time()) - 1,
             "refresh_token": rt,
             "scope": SPOTIFY_SCOPES,
         }
