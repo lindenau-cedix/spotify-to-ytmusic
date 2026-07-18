@@ -236,7 +236,12 @@ def iter_playlist_tracks(
         page = r.json()
         snapshot_id = snapshot_id or (page.get("snapshot_id") or "")
         for it in page.get("items") or []:
-            track = it.get("track")
+            # On /v1/playlists/{id}/items the payload lives under `item`; the
+            # old `track` key is deprecated and comes back null for many
+            # accounts. Read `item` first, fall back to `track` for older
+            # response shapes. (This is why every playlist showed 0 tracks:
+            # the loop only read `track`, got None, and skipped every entry.)
+            track = it.get("item") or it.get("track")
             if track is None:
                 continue
             # Local files have no id; episodes don't either. Either way they
