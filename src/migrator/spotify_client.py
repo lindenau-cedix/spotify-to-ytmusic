@@ -23,6 +23,8 @@ from threading import Thread
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+import requests  # used by iter_playlist_tracks; see note in that function.
+
 import spotipy
 from spotipy.cache_handler import CacheHandler
 from spotipy.oauth2 import SpotifyOAuth
@@ -207,15 +209,31 @@ def iter_playlist_tracks(
 
     Skips None entries (e.g. local files Spotify can't resolve) and unwraps
     `track` from `episode` rows where present.
+
+    NOTE: We bypass Spotipy here. Spotipy >=2.24 hits the legacy
+    `/v1/playlists/{id}/tracks` endpoint for `playlist_items`. Spotify has
+    restricted that path for Development-mode apps (and possibly the long
+    form itself; see Spotify's February 2026 Get-Playlist-Items docs) and
+    it returns 403 for own playlists even with the right scope. The
+    replacement path `/v1/playlists/{id}/items` returns 200 on the same
+    token. We re-implement just enough of Spotipy's pagination to keep the
+    public contract of this function unchanged. Episodes are filtered by
+    passing `additional_types=track`; without that filter Spotify now
+    returns podcast episodes too.
     """
     items: list[dict[str, Any]] = []
     snapshot_id = ""
-    # NOTE: no `fields=` mask AND restrict `additional_types` to track only.
-    # The default `additional_types=("track","episode")` makes Spotify return
-    # 403 on the `/tracks` endpoint for some user-owned playlists in
-    # Development Mode. We don't migrate episodes, so just ask for tracks.
-    page = sp.playlist_items(playlist_id, limit=100, additional_types=("track",))
+    headers = {"Authorization": f"Bearer {sp.auth_manager.get_access_token()['access_token']}"}
+    url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
+    params: dict[str, Any] = {"limit": 100, "additional_types": "track"}
     while True:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        if not r.ok:
+            raise spotipy.SpotifyException(
+                http_status=r.status_code, code=-1, msg=r.text[:300],
+                reason=r.reason or "error",
+            )
+        page = r.json()
         snapshot_id = snapshot_id or (page.get("snapshot_id") or "")
         for it in page.get("items") or []:
             track = it.get("track")
@@ -226,8 +244,19 @@ def iter_playlist_tracks(
             if not track.get("id"):
                 continue
             items.append(track)
-        if page.get("next"):
-            page = sp.next(page)
-        else:
+        # Spotify paginates via absolute `next` URLs on /items too. Reuse
+        # the URL; advance the offset from the previous page's count so
+        # the call still works if `next` ever omits its query string.
+        next_url = page.get("next")
+        if not next_url:
             break
+        parsed = urlparse(next_url)
+        url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        params = dict(parse_qs(parsed.query))
+        # `parse_qs` returns lists; flatten + carry forward explicit_limit.
+        params = {k: v[0] for k, v in params.items()}
+        if "limit" not in params:
+            params["limit"] = "100"
+        if "additional_types" not in params:
+            params["additional_types"] = "track"
     return snapshot_id, items
