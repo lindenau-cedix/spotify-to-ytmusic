@@ -185,9 +185,11 @@ class Matcher:
         top_k: int | None = None,
         accept_threshold: float | None = None,
         review_threshold: float | None = None,
+        strict_search: bool = False,
     ) -> None:
         s = get_settings()
         self.client = client
+        self.strict_search = strict_search  # if True, surface throttle instead of degrading
         self.concurrency = concurrency or s.concurrency
         self.top_k = top_k or s.toml.matching.search_top_k
         self.accept_threshold = accept_threshold or s.threshold_accept
@@ -200,7 +202,7 @@ class Matcher:
         isrc_hit = False
         # Tier 1: ISRC
         if req.isrc:
-            isrc_hits = self.client.search_by_isrc(req.isrc)
+            isrc_hits = await asyncio.to_thread(self.client.search_by_isrc, req.isrc)
             if isrc_hits and any(c.get("videoId") for c in isrc_hits):
                 candidates = [c for c in isrc_hits if c.get("videoId")][: self.top_k]
                 isrc_hit = True
@@ -209,7 +211,12 @@ class Matcher:
         method = "isrc" if isrc_hit else "search"
         if not candidates:
             query = f"{req.title} {' '.join(req.artists)}".strip()
-            candidates = self.client.search_songs(query, limit=self.top_k)
+            search_fn = (
+                self.client.search_songs_strict
+                if self.strict_search
+                else self.client.search_songs
+            )
+            candidates = await asyncio.to_thread(search_fn, query, self.top_k)
             method = "search"
 
         # Score & pick.
@@ -251,30 +258,38 @@ class Matcher:
     async def match_many(
         self, requests: Iterable[MatchRequest], on_done: Callable[[MatchResult], Awaitable[None]] | None = None
     ) -> list[MatchResult]:
-        sem = asyncio.Semaphore(self.concurrency)
+        # A shared lock serialises the actual YTM calls. Concurrency still
+        # buys us overlap on I/O the matcher does outside ytmusicapi (mostly
+        # scoring), but more importantly it caps the burst rate at "one call
+        # at a time" — the only setting that survives contact with YTM's
+        # anti-abuse limiter for a fresh session. The limiter trips after a
+        # handful of concurrent searches; spacing them out is the single
+        # biggest lever for getting through a full playlist.
+        lock = asyncio.Lock()
         results: list[MatchResult] = []
 
         async def _run(req: MatchRequest) -> MatchResult:
+            try:
+                # Serialise the network call; scoring is already off-thread.
+                async with lock:
+                    r = await self.match_one(req)
+            except Exception as e:  # noqa: BLE001
+                log.warning("match error", extra={"track_id": req.spotify_track_id, "err": str(e)})
+                r = MatchResult(request=req, method="error", status="skipped")
+            if on_done:
+                await on_done(r)
+            return r
+
+        # Honour the configured concurrency for parallel scoring work, but
+        # the YTM call itself is serialised via the lock above. This means
+        # raising concurrency above 1 only helps if the matcher gains more
+        # non-network work later; for now it's effectively sequential.
+        sem = asyncio.Semaphore(self.concurrency)
+        async def _bounded(req: MatchRequest) -> MatchResult:
             async with sem:
-                try:
-                    r = await asyncio.to_thread(self._sync_match_one, req)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("match error", extra={"track_id": req.spotify_track_id, "err": str(e)})
-                    r = MatchResult(request=req, method="error", status="skipped")
-                if on_done:
-                    await on_done(r)
-                return r
-
-        results = await asyncio.gather(*[_run(r) for r in requests])
+                return await _run(req)
+        results = await asyncio.gather(*[_bounded(r) for r in requests])
         return results
-
-    def _sync_match_one(self, req: MatchRequest) -> MatchResult:
-        # Run the (blocking) YTM calls in the worker thread.
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(self.match_one(req))
-        finally:
-            loop.close()
 
 
 # ---------- persistence helpers ----------

@@ -190,16 +190,99 @@ def ensure_client() -> spotipy.Spotify:
 # ---------- data helpers ----------
 
 def list_playlists(sp: spotipy.Spotify) -> list[dict[str, Any]]:
-    """Paginate through current_user_playlists (handles >50)."""
+    """Paginate through current_user_playlists (handles >50).
+
+    Bypasses Spotipy's `requests.Session` and goes through
+    `_get_with_rate_limit_retry` directly — otherwise a Spotify-side 429 on
+    the *first* call is swallowed by urllib3's default retry policy, which
+    silently sleeps for ``Retry-After`` seconds with no log and no
+    exception. `migrator run` would wipe state, then "do nothing" forever
+    because the only visible line is the wipe message. The tracks endpoint
+    (`iter_playlist_tracks`) already uses this helper.
+    """
+    settings = get_settings()
+    token = sp.auth_manager.get_access_token()
+    if isinstance(token, dict):
+        access_token = token.get("access_token") or ""
+    else:
+        access_token = token or ""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    base_params: dict[str, Any] = {"limit": 50}
     results: list[dict[str, Any]] = []
-    page = sp.current_user_playlists(limit=50)
+    url = "https://api.spotify.com/v1/me/playlists"
+    params = dict(base_params)
     while True:
+        r = _get_with_rate_limit_retry(
+            url, headers=headers, params=params, timeout=30, op="current_user_playlists",
+        )
+        if not r.ok:
+            raise spotipy.SpotifyException(
+                http_status=r.status_code, code=-1, msg=r.text[:300],
+                reason=r.reason or "error",
+            )
+        page = r.json()
         results.extend(page.get("items") or [])
-        if page.get("next"):
-            page = sp.next(page)
-        else:
+        next_url = page.get("next")
+        if not next_url:
             break
+        parsed = urlparse(next_url)
+        url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        if "limit" not in params:
+            params["limit"] = "50"
     return results
+
+
+def _get_with_rate_limit_retry(
+    url: str,
+    *,
+    headers: dict[str, str],
+    params: dict[str, Any],
+    timeout: float,
+    op: str,
+) -> requests.Response:
+    """GET with indefinite retry on Spotify 429 (and transient 5xx).
+
+    Spotify's API returns 429 with a `Retry-After` header (seconds) when an
+    app bursts past its per-minute request budget — common during bulk
+    export. Because export runs unattended, we'd rather wait than give up
+    and orphan the rest of the playlist, so this loops forever on 429/5xx
+    with exponential backoff capped at `rate_limit_max_backoff_seconds`
+    (so a single sleep never stretches past that ceiling). `Retry-After`
+    overrides the computed backoff (still clamped to the cap). Non-429 4xx
+    surfaces immediately so genuine errors (404, 401) don't get retried.
+    """
+    s = get_settings().toml.spotify
+    base = s.rate_limit_backoff_seconds
+    cap = s.rate_limit_max_backoff_seconds
+    attempt = 0
+    while True:
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if resp.status_code != 429 and resp.status_code < 500:
+            return resp
+        # Retry-After may be a delta-seconds integer or an HTTP-date; the
+        # Spotify API uses seconds. Parse defensively, fall back on error.
+        retry_after_s: float | None = None
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            try:
+                retry_after_s = float(ra)
+            except ValueError:
+                retry_after_s = None
+        sleep_s = retry_after_s if retry_after_s is not None else base * (2 ** attempt)
+        sleep_s = min(sleep_s, cap)
+        log.warning(
+            "Spotify rate-limited; backing off",
+            extra={
+                "op": op,
+                "attempt": attempt,
+                "status": resp.status_code,
+                "retry_after_s": retry_after_s,
+                "sleep_s": sleep_s,
+            },
+        )
+        time.sleep(sleep_s)
+        attempt += 1
 
 
 def iter_playlist_tracks(
@@ -209,6 +292,9 @@ def iter_playlist_tracks(
 
     Skips None entries (e.g. local files Spotify can't resolve) and unwraps
     `track` from `episode` rows where present.
+
+    Retries 429s (and transient 5xx) per-page via `_get_with_rate_limit_retry`
+    — a single mid-pagination 429 no longer aborts the whole playlist.
 
     NOTE: We bypass Spotipy here. Spotipy >=2.24 hits the legacy
     `/v1/playlists/{id}/tracks` endpoint for `playlist_items`. Spotify has
@@ -227,7 +313,12 @@ def iter_playlist_tracks(
     url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
     params: dict[str, Any] = {"limit": 100, "additional_types": "track"}
     while True:
-        r = requests.get(url, headers=headers, params=params, timeout=30)
+        # `_get_with_rate_limit_retry` retries indefinitely on 429 / transient
+        # 5xx, so on success it returns a 2xx response. Any non-2xx that
+        # reaches us is a genuine error (404, 401, …) and must surface.
+        r = _get_with_rate_limit_retry(
+            url, headers=headers, params=params, timeout=30, op=f"playlist_items:{playlist_id}",
+        )
         if not r.ok:
             raise spotipy.SpotifyException(
                 http_status=r.status_code, code=-1, msg=r.text[:300],

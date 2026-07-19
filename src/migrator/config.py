@@ -66,13 +66,75 @@ class MatchingSection(BaseModel):
     duration_tolerance_strict_seconds: int = 3
     duration_tolerance_loose_seconds: int = 10
     search_top_k: int = 5
+    # Search backoff is intentionally lighter than the importing knobs: search
+    # runs per-track (hundreds of calls), so we want a fast exponential retry
+    # rather than the 30s×3 wait that suits a handful of import batches.
+    # Cumulative wait ~45s, which is enough to ride out YTM's anti-abuse
+    # window after a fresh auth (the limiter typically clears in 30–60s;
+    # previous budget of 6s gave up before the window opened).
+    search_retry_backoff_seconds: float = 3.0
+    search_retry_max_retries: int = 6
+    # Per-sleep ceiling — keeps a single retry from stretching past a minute
+    # even if we crank the retry count up further. The cumulative budget is
+    # what buys throttle survival; the cap is just sanity.
+    search_retry_max_backoff_seconds: float = 60.0
 
 
 class ImportingSection(BaseModel):
     batch_size: int = 50
     rate_limit_backoff_seconds: int = 30
-    rate_limit_max_retries: int = 3
+    rate_limit_max_retries: int = 5
+    # Ceiling on a single retry sleep, so the 30s×2**n ramp doesn't stretch a
+    # late attempt into a 15-minute stall on an unattended run.
+    rate_limit_max_backoff_seconds: float = 120.0
     default_privacy: str = "PRIVATE"
+    # Minimum spacing between successive playlist creations, to stay under
+    # YouTube's anti-abuse throttle on rapid create_playlist calls.
+    create_min_interval_seconds: float = 2.0
+    # Spacing between successive add_playlist_items batches. YouTube's limiter
+    # keys on the rate of playlist mutations, so pacing here is what prevents
+    # 409s and dropped connections rather than recovering from them.
+    # Measured against a real 707-track run: at 2.5s YouTube throttled 12 of
+    # ~15 batches, each costing a 30s+ backoff. Higher pacing is faster here.
+    batch_interval_seconds: float = 6.0
+    # Extra pause after splitting a batch that came back 409 — the split only
+    # helps if we also give the playlist a moment to settle.
+    conflict_cooldown_seconds: float = 15.0
+    # Don't split a refused batch below this size (see add_playlist_items).
+    min_batch_size: int = 10
+
+
+class SpotifySection(BaseModel):
+    # Spotify's Web API returns HTTP 429 with a `Retry-After` header when an
+    # app bursts past its per-minute request budget — common during bulk
+    # export, where we hit /v1/playlists/{id}/items once per page per
+    # playlist. Without retry, a single 429 mid-export aborts the whole
+    # playlist with "Skipped … HTTP 429". We retry indefinitely (the export
+    # runs unattended, so giving up after N attempts orphan-half-a-playlist is
+    # worse than waiting) with exponential backoff capped at
+    # `rate_limit_max_backoff_seconds` so a single sleep never stretches
+    # past that ceiling. Retry-After (when Spotify sends one) is honoured and
+    # counts against the same cap.
+    rate_limit_backoff_seconds: float = 5.0
+    rate_limit_max_backoff_seconds: float = 600.0
+
+
+class YtmSection(BaseModel):
+    """Where the YouTube Music session cookie comes from.
+
+    "auto" reads the browser's live cookie and falls back to
+    headers_auth.json if that's unavailable; "browser" fails loudly instead of
+    falling back; "file" is the original snapshot-only behaviour. Default is
+    "auto" because a hand-exported snapshot stops authenticating ~15-20 min
+    after export — see browser_cookies.py.
+    """
+
+    cookie_source: str = "auto"
+    browser: str = "chrome"
+    # How often to re-read the browser cookie during a long run. The whole
+    # point is to outlive a single snapshot, so this must be well under the
+    # ~15 min a snapshot survives.
+    refresh_interval_seconds: float = 300.0
 
 
 class LoggingSection(BaseModel):
@@ -87,6 +149,8 @@ class TomlSettings(BaseModel):
     server: ServerSection = ServerSection()
     matching: MatchingSection = MatchingSection()
     importing: ImportingSection = ImportingSection()
+    ytm: YtmSection = YtmSection()
+    spotify: SpotifySection = SpotifySection()
     logging: LoggingSection = LoggingSection()
 
 
@@ -184,7 +248,13 @@ class Settings:
 
     @property
     def concurrency(self) -> int:
-        return self.env.migrator_match_concurrency or self.toml.matching.concurrency
+        # Explicit env override wins. The previous `env or toml` chain used the
+        # field default (4) whenever env was unset, silently overriding a
+        # lower value in config.toml — `4 or 1` is `4`. Use `model_fields_set`
+        # to detect an explicit env value and fall through to toml otherwise.
+        if "migrator_match_concurrency" in self.env.model_fields_set:
+            return self.env.migrator_match_concurrency
+        return self.toml.matching.concurrency
 
     @property
     def threshold_accept(self) -> float:

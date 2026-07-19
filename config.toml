@@ -10,18 +10,76 @@ host = "127.0.0.1"
 port = 8000
 
 [matching]
-concurrency = 4
+# Match-many runs N worker coroutines concurrently, but the actual YTM search
+# call is serialised behind an asyncio.Lock — YTM's anti-abuse limiter
+# otherwise fires after a handful of unauthenticated concurrent searches, even
+# from a fresh session. Raising `concurrency` only helps if the matcher grows
+# non-network work; for now it's effectively the number of scoring workers,
+# and the search itself runs strictly one-at-a-time. Kept as a knob for the
+# day we add more CPU work to match_one.
+concurrency = 1
 threshold_accept = 0.7
 threshold_review = 0.4
 duration_tolerance_strict_seconds = 3
 duration_tolerance_loose_seconds = 10
 search_top_k = 5
+# Lighter than [importing] backoff: search runs per-track, so retry fast.
+# Cumulative wait ~45s, enough to ride out YTM's anti-abuse window after a
+# fresh auth (the limiter typically clears in 30–60s; 2.0s×3 was giving up
+# at ~6s before the window opened).
+search_retry_backoff_seconds = 3.0
+search_retry_max_retries = 6
+# Per-sleep ceiling so a single retry never stretches past a minute.
+search_retry_max_backoff_seconds = 60.0
 
 [importing]
 batch_size = 50
 rate_limit_backoff_seconds = 30
-rate_limit_max_retries = 3
+rate_limit_max_retries = 5
+# Per-sleep ceiling: 30s×2**n would otherwise reach ~8min on the last attempt.
+rate_limit_max_backoff_seconds = 120.0
 default_privacy = "PRIVATE"
+# Min spacing between playlist creations to dodge YTM's rapid-create throttle.
+create_min_interval_seconds = 2.0
+# Min spacing between add_playlist_items batches. YouTube throttles on the
+# *rate* of playlist edits — back-to-back batches are what produced the
+# "HTTP 409: Conflict" and "connection reset by peer" failures mid-run.
+# Pacing prevents those; the retry/split logic below only cleans up after them.
+# Measured: at 2.5s a 707-track run tripped the limiter on 12 of ~15 batches,
+# and each trip costs a 30s+ backoff — so paying 6s up front is also *faster*
+# than being throttled, not just gentler.
+batch_interval_seconds = 6.0
+# Cool-down after splitting a batch YouTube answered with 409.
+conflict_cooldown_seconds = 15.0
+min_batch_size = 10
+
+[ytm]
+# A cookie exported by hand from DevTools is a snapshot, and it stops
+# authenticating ~15-20 min later even though the browser it came from stays
+# signed in — Google rotates the session-continuation cookies through
+# accounts.google.com, and the youtubei endpoints we call never send those
+# rotations back for us to pick up. Reading the browser's live store is the
+# only thing that survives a long import.
+#   "auto"    – live browser cookie, falling back to headers_auth.json
+#   "browser" – live browser cookie only (fail loudly if unavailable)
+#   "file"    – headers_auth.json only (original snapshot behaviour)
+cookie_source = "auto"
+browser = "chrome"
+# Re-read during long runs. Must stay well under a snapshot's ~15 min life.
+refresh_interval_seconds = 300.0
+
+[spotify]
+# Spotify's Web API returns HTTP 429 (with a `Retry-After` header) when an app
+# bursts past its per-minute budget — common during bulk export, where we hit
+# /v1/playlists/{id}/items once per page per playlist. Without retry, a single
+# 429 mid-export aborts the whole playlist with "Skipped … HTTP 429". The
+# per-page GET retries INDEFINITELY — the export runs unattended, and giving
+# up after N attempts is worse than waiting. Backoff is exponential and capped
+# at `rate_limit_max_backoff_seconds` so a single sleep never stretches past
+# that ceiling. `Retry-After` (when Spotify sends one) is honoured and counts
+# against the same cap.
+rate_limit_backoff_seconds = 5.0
+rate_limit_max_backoff_seconds = 600.0
 
 [logging]
 level = "INFO"

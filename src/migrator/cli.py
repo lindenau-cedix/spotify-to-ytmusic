@@ -19,7 +19,9 @@ from .config import get_settings
 from .db import (
     Playlists,
     Tracks,
+    accept_reviews,
     auth_ok,
+    get_playlist,
     get_session,
     list_playlists,
     set_ytm_playlist_id,
@@ -225,9 +227,24 @@ def export(
 
     from .db import Tracks as T, get_engine
 
+    import spotipy
+
     engine = get_engine()
+    failures: list[tuple[str, str]] = []
     for meta in pls:
-        sid, items = iter_playlist_tracks(sp, meta["id"])
+        try:
+            sid, items = iter_playlist_tracks(sp, meta["id"])
+        except spotipy.SpotifyException as e:
+            # A single unreadable playlist (commonly a Spotify-owned /
+            # algorithmic / editorial playlist you follow, which 403s on the
+            # items endpoint for Development-mode apps) must not abort the
+            # whole export. Record it and move on.
+            failures.append((meta["name"], f"{e.http_status}: {e.reason}"))
+            console.print(
+                f"[yellow]Skipped[/yellow] {meta['name']} "
+                f"(HTTP {e.http_status}: {e.reason})"
+            )
+            continue
         console.print(f"[bold]{meta['name']}[/bold]  ({len(items)} tracks) snapshot={sid}")
         if dry_run:
             continue
@@ -269,7 +286,15 @@ def export(
                     )
                 )
             s.commit()
-    console.print("[green]Export complete[/green]")
+    if failures:
+        console.print(
+            f"[green]Export complete[/green] "
+            f"([yellow]{len(failures)} playlist(s) skipped[/yellow])"
+        )
+        for name, why in failures:
+            console.print(f"  [yellow]•[/yellow] {name} — {why}")
+    else:
+        console.print("[green]Export complete[/green]")
 
 
 # ---------- match ----------
@@ -280,6 +305,12 @@ def match(
         None, help="One playlist ID, or omit to match every exported playlist."
     ),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    lenient: bool = typer.Option(
+        False,
+        "--lenient",
+        help="Silently skip tracks YTM can't find instead of failing the playlist "
+        "on a throttle. Default surfaces the throttle so you can wait and retry.",
+    ),
 ) -> None:
     """Run matching for one — or every — previously-exported playlist."""
     setup_logging()
@@ -287,7 +318,7 @@ def match(
         console.print("[red]YTM not authenticated.[/red]")
         raise typer.Exit(1)
     ytm = ensure_ytm_client(dry_run=dry_run)
-    matcher = Matcher(ytm)
+    matcher = Matcher(ytm, strict_search=not lenient)
     if playlist_id is not None:
         _run_matching(matcher, playlist_id, dry_run=dry_run)
         return
@@ -306,10 +337,12 @@ def match(
             succeeded.append(p.playlist_id)
         except typer.Exit as e:
             # Honor intentional exits (e.g. "no tracks in DB"); not a failure.
-            if e.code in (None, 0):
+            # Click renamed `code` → `exit_code` in 8.1; guard both for safety.
+            code = getattr(e, "exit_code", getattr(e, "code", None))
+            if code in (None, 0):
                 succeeded.append(p.playlist_id)
             else:
-                failed.append((p.playlist_id, f"exit code {e.code}"))
+                failed.append((p.playlist_id, f"exit code {code}"))
         except Exception as e:  # noqa: BLE001
             log.exception("matching failed", extra={"playlist_id": p.playlist_id})
             failed.append((p.playlist_id, str(e)))
@@ -362,6 +395,70 @@ def _run_matching(matcher: Matcher, playlist_id: str, *, dry_run: bool) -> None:
     console.print("Next: open the review UI for any 'review' rows: python -m migrator serve")
 
 
+# ---------- accept ----------
+
+@app.command(name="accept")
+def accept_cmd(
+    playlist_id: Optional[str] = typer.Argument(
+        None, help="One playlist ID, or omit to accept reviews across every playlist."
+    ),
+    threshold: float = typer.Option(
+        0.0,
+        "--threshold",
+        "-t",
+        min=0.0,
+        max=1.0,
+        help="Only accept review rows scoring at least this (0.0 = every one).",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show counts; don't write."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Accept every 'review' match so `import` will push it to YTM.
+
+    This is the bulk equivalent of clicking accept on each row in the web
+    review queue: it flips `review` → `accepted` for the current snapshot.
+    Rows matching found no candidate for are left in `review` — there's no
+    videoId to import, so accepting them would silently drop them.
+    """
+    setup_logging()
+    preview = accept_reviews(playlist_id, threshold=threshold, dry_run=True)
+    if playlist_id is not None and not preview and get_playlist(playlist_id) is None:
+        console.print(f"[red]Playlist {playlist_id} not exported yet.[/red]")
+        raise typer.Exit(1)
+
+    total = sum(s.accepted for s in preview)
+    stranded = sum(s.no_candidate for s in preview)
+    if not total:
+        console.print("[yellow]No review matches to accept.[/yellow]")
+        if stranded:
+            console.print(
+                f"[dim]{stranded} review row(s) have no candidate — "
+                "resolve them by hand: python -m migrator serve[/dim]"
+            )
+        raise typer.Exit(0)
+
+    for s in preview:
+        console.print(f"  {s.name} ({s.playlist_id}): {s.accepted} to accept")
+    if dry_run:
+        console.print(f"[bold]Dry run:[/bold] would accept {total} match(es)")
+        return
+
+    if not yes:
+        n_pls = 1 if playlist_id is not None else len(preview)
+        scope = f"{n_pls} playlist{'' if n_pls == 1 else 's'}"
+        if not typer.confirm(f"Accept {total} review match(es) across {scope}?", default=True):
+            raise typer.Abort()
+
+    applied = accept_reviews(playlist_id, threshold=threshold)
+    n = sum(s.accepted for s in applied)
+    console.print(f"[green]Accepted {n} match(es)[/green]")
+    if stranded:
+        console.print(
+            f"[yellow]{stranded} review row(s) left — no candidate to accept.[/yellow]"
+        )
+    console.print("Next: python -m migrator import")
+
+
 # ---------- import ----------
 
 @app.command(name="import")
@@ -383,6 +480,7 @@ def import_cmd(  # `import` is a Python keyword; registered under explicit name
     # is byte-identical to before.
     if playlist_id is not None:
         ytm = ensure_ytm_client(dry_run=dry_run)
+        _preflight_signed_in(ytm)
         _import_one(ytm, playlist_id, dry_run=dry_run, yes_assumed=yes)
         return
 
@@ -407,6 +505,7 @@ def import_cmd(  # `import` is a Python keyword; registered under explicit name
             raise typer.Abort()
 
     ytm = ensure_ytm_client(dry_run=dry_run)
+    _preflight_signed_in(ytm)
     console.print(f"Importing {len(plan['to_process'])} playlists …")
     succeeded: list[str] = []
     failed: list[tuple[str, str]] = []
@@ -417,14 +516,32 @@ def import_cmd(  # `import` is a Python keyword; registered under explicit name
             _import_one(ytm, pid, dry_run=dry_run, yes_assumed=True)
             succeeded.append(pid)
         except typer.Exit as e:
-            if e.code in (None, 0):
+            # Click renamed `code` → `exit_code` in 8.1; guard both for safety.
+            code = getattr(e, "exit_code", getattr(e, "code", None))
+            if code in (None, 0):
                 succeeded.append(pid)
             else:
-                failed.append((pid, f"exit code {e.code}"))
+                failed.append((pid, f"exit code {code}"))
         except Exception as e:  # noqa: BLE001
             log.exception("import failed", extra={"playlist_id": pid})
             failed.append((pid, str(e)))
     _print_batch_summary("imported", succeeded, failed)
+
+
+def _preflight_signed_in(ytm: YTMClient) -> None:
+    """Abort before any write if YouTube considers the session signed out.
+
+    Without this the run proceeds normally — reads succeed anonymously — and
+    fails only at the first playlist edit, with an ownership error that reads
+    like the playlist is someone else's rather than like a dead cookie.
+    """
+    from .ytm_client import YTMSignedOutError
+
+    try:
+        ytm.assert_signed_in()
+    except YTMSignedOutError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
 
 
 def _plan_batch_imports(
@@ -510,6 +627,45 @@ def _import_one(
         console.print("[yellow]Nothing to import (no accepted matches). Run `match` + review.[/yellow]")
         raise typer.Exit(0)
 
+    # Reconcile against what YouTube actually holds before computing the delta.
+    # `imported_tracks` only ever recorded *confirmed* adds, so tracks that
+    # landed during a run that died — or during a batch YouTube refused after
+    # partially applying an earlier attempt — are invisible to us. Re-sending
+    # them is not merely wasteful: a duplicate fails its entire batch, so a
+    # handful of unrecorded tracks blocks every other track batched with them.
+    # Backfill them so the delta is honest and the batches are clean.
+    if ytm_pid and not dry_run:
+        live = ytm.playlist_video_ids(ytm_pid)
+        unrecorded = live - already
+        if unrecorded:
+            by_video: dict[str, str] = {}
+            for m, t in chosen:
+                by_video.setdefault(m.chosen_video_id, t.spotify_track_id)
+            recovered = 0
+            with Session(engine) as s:
+                for vid in unrecorded:
+                    sp = by_video.get(vid)
+                    if sp is None:
+                        continue  # on YTM but not ours to claim — leave it be
+                    s.add(
+                        ImportedTracks(
+                            playlist_id=playlist_id,
+                            ytm_playlist_id=ytm_pid,
+                            video_id=vid,
+                            spotify_track_id=sp,
+                        )
+                    )
+                    recovered += 1
+                s.commit()
+            # Union regardless of what we could attribute: anything already on
+            # the playlist must stay out of the batch, recorded or not.
+            already |= live
+            if recovered:
+                console.print(
+                    f"[dim]Reconciled {recovered} track(s) already on YTM but not "
+                    f"recorded locally.[/dim]"
+                )
+
     if ytm_pid:
         console.print(f"Resuming into existing YTM playlist [bold]{ytm_pid}[/bold] ({len(already)} already imported)")
     else:
@@ -529,13 +685,44 @@ def _import_one(
         if not dry_run:
             set_ytm_playlist_id(playlist_id, ytm_pid)
 
-    todo = [m.chosen_video_id for m, _ in chosen if m.chosen_video_id and m.chosen_video_id not in already]
+    # Order-preserving dedupe. YouTube refuses an entire add batch when the same
+    # videoId appears twice in it, and the matcher maps distinct Spotify tracks
+    # onto one video often enough — album and single releases of the same
+    # recording, or a track duplicated inside the Spotify playlist — that a raw
+    # list silently costs up to `batch_size` tracks per collision.
+    todo: list[str] = []
+    seen_vids: set[str] = set()
+    for m, _t in chosen:
+        vid = m.chosen_video_id
+        if vid and vid not in already and vid not in seen_vids:
+            seen_vids.add(vid)
+            todo.append(vid)
     if not todo:
         console.print("[green]Already fully imported.[/green]")
         raise typer.Exit(0)
 
     console.print(f"Adding {len(todo)} tracks to YTM playlist {ytm_pid} …")
     added = ytm.add_playlist_items(ytm_pid, todo)
+    if getattr(ytm, "last_add_aborted", False):
+        console.print(
+            "[yellow]Stopped early after repeated throttling — not all batches were "
+            "attempted. Wait a while, then re-run to resume.[/yellow]"
+        )
+    rejected = getattr(ytm, "last_add_rejected", 0)
+    if rejected:
+        # Name them: these are almost always already in the playlist under
+        # YouTube's canonical videoId, so "missing" here usually means "present
+        # but unrecognisable to us", and the user should check before chasing it.
+        by_video = {m.chosen_video_id: t for m, t in chosen}
+        console.print(
+            f"[yellow]YouTube refused {rejected} track(s) — already in the playlist "
+            f"under a different videoId, or unavailable. The rest of the batch "
+            f"still imported.[/yellow]"
+        )
+        for vid in getattr(ytm, "rejected_video_ids", [])[:10]:
+            t = by_video.get(vid)
+            label = f"{t.name}" if t is not None else "(unknown track)"
+            console.print(f"  [dim]{vid}  {label}[/dim]")
 
     if not dry_run:
         with Session(engine) as s:
@@ -567,82 +754,81 @@ def _import_one(
 @app.command()
 def run(
     playlist_id: Optional[str] = typer.Argument(
-        None, help="One playlist ID, or omit to run the full pipeline over every playlist."
+        None,
+        help=(
+            "One playlist ID. Without an ID, exports every Spotify playlist on "
+            "first run; subsequent runs just import the previously-matched tracks."
+        ),
     ),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
-    """End-to-end: export → match → (review) → import. Skips review queue.
+    """Incremental migration: export once, then just import.
 
-    With no playlist_id, exports every Spotify playlist, then matches + imports
-    each one in turn. Per-playlist failures are logged and the batch continues.
+    The first invocation (no playlists in the DB yet) exports from Spotify
+    and then imports whatever matches are already present. Every subsequent
+    invocation skips the export — it only pushes the existing accepted
+    matches to YouTube Music via ``import_cmd``. Run ``match`` (and resolve
+    ``review`` rows in the web UI) between ``run`` invocations to feed new
+    matches into YTM.
+
+    Progress is preserved across runs: matches, imported_tracks, and the
+    ``ytm_playlist_id`` / ``imported_at`` columns survive. Pass ``--dry-run``
+    to preview the export/import steps without writing to the DB or YTM.
     """
     setup_logging()
-    if not auth_ok("spotify"):
-        console.print("[red]Spotify not authenticated.[/red]")
-        raise typer.Exit(1)
-    if not auth_ok("ytm"):
-        console.print("[red]YTM not authenticated.[/red]")
-        raise typer.Exit(1)
+    pls = list_playlists()
+    first_run = not pls
 
-    # Step 1: export (already iterates all Spotify playlists when playlist_id is None).
-    export(playlist_id=playlist_id, dry_run=dry_run)
+    if first_run:
+        if not auth_ok("spotify"):
+            console.print("[red]Spotify not authenticated.[/red]")
+            raise typer.Exit(1)
+        if not auth_ok("ytm"):
+            console.print("[red]YTM not authenticated.[/red]")
+            raise typer.Exit(1)
+        console.print("[bold]First run — exporting Spotify playlists …[/bold]")
+        export(playlist_id=playlist_id, dry_run=dry_run)
+        # Re-read so we pick up the rows that were just written (or, in
+        # --dry-run mode, the ones already present before the dry export).
+        pls = list_playlists()
+        if not pls:
+            console.print("[yellow]No playlists to process.[/yellow]")
+            raise typer.Exit(0)
+    else:
+        # Subsequent runs only need YTM creds — Spotify export is skipped.
+        if not auth_ok("ytm"):
+            console.print("[red]YTM not authenticated.[/red]")
+            raise typer.Exit(1)
+        console.print(
+            f"[dim]Existing data found ({len(pls)} playlist(s)) — "
+            "skipping export, importing only.[/dim]"
+        )
 
-    # Step 2: match + import. Single-playlist path keeps the original behavior
-    # (review-queue abort, single-shot summary). Batch path continues past errors.
-    pls = [playlist_id] if playlist_id is not None else [p.playlist_id for p in list_playlists()]
-    if not pls:
-        console.print("[yellow]No playlists to process.[/yellow]")
-        raise typer.Exit(0)
+    # Single-playlist path delegates straight to import_cmd so its exit codes
+    # and "nothing to import" messages stay identical to a manual import.
+    if playlist_id is not None:
+        import_cmd(playlist_id=playlist_id, dry_run=dry_run, yes=True)
+        return
 
-    ytm = ensure_ytm_client(dry_run=dry_run)
-    matcher = Matcher(ytm)
+    # Batch path: continue past per-playlist failures.
     succeeded: list[str] = []
     failed: list[tuple[str, str]] = []
-    for pid in pls:
+    for p in pls:
+        console.print(f"\n[bold]== {p.name}[/bold]  ({p.playlist_id})")
         try:
-            _run_pipeline_for_one(matcher, pid, dry_run=dry_run)
-            succeeded.append(pid)
+            import_cmd(playlist_id=p.playlist_id, dry_run=dry_run, yes=True)
+            succeeded.append(p.playlist_id)
         except typer.Exit as e:
-            if e.code in (None, 0):
-                succeeded.append(pid)
+            # Click renamed `code` → `exit_code` in 8.1; guard both for safety.
+            code = getattr(e, "exit_code", getattr(e, "code", None))
+            if code in (None, 0):
+                succeeded.append(p.playlist_id)
             else:
-                failed.append((pid, f"exit code {e.code}"))
+                failed.append((p.playlist_id, f"exit code {code}"))
         except Exception as e:  # noqa: BLE001
-            log.exception("pipeline failed", extra={"playlist_id": pid})
-            failed.append((pid, str(e)))
-    if playlist_id is not None:
-        return  # single-playlist mode preserves the original exit codes
-    _print_batch_summary("migrated", succeeded, failed)
-
-
-def _run_pipeline_for_one(matcher: Matcher, playlist_id: str, *, dry_run: bool) -> None:
-    """Run matching, then import (skipping on review rows) for one playlist.
-
-    Mirrors the original `run` body. On any review rows left, abort the
-    auto-import step so the user can resolve them in the UI first — but
-    treat that abort as a successful pipeline step (code 0).
-    """
-    _run_matching(matcher, playlist_id, dry_run=dry_run)
-    from sqlmodel import Session, select
-
-    from .db import Matches, get_engine
-
-    engine = get_engine()
-    with Session(engine) as s:
-        review_count = len(
-            s.exec(
-                select(Matches).where(
-                    Matches.playlist_id == playlist_id, Matches.status == "review"
-                )
-            ).all()
-        )
-    if review_count:
-        console.print(
-            f"[yellow]{review_count} tracks in review queue. "
-            f"Open the UI to resolve them, then re-run `import {playlist_id}`.[/yellow]"
-        )
-        raise typer.Exit(0)
-    import_cmd(playlist_id=playlist_id, dry_run=dry_run, yes=True)
+            log.exception("import failed", extra={"playlist_id": p.playlist_id})
+            failed.append((p.playlist_id, str(e)))
+    _print_batch_summary("imported", succeeded, failed)
 
 
 # ---------- serve ----------

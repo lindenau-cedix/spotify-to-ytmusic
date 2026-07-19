@@ -80,26 +80,66 @@ file path or an upload through the web UI at `/setup`.
 
 ## Migrate a playlist
 
+`run` is incremental — it exports your Spotify playlists once, then on
+later invocations just pushes the already-decided matches to YouTube Music.
+
 ```bash
 # See your playlists:
 python -m migrator list
 
-# Export + match + import (skips any rows still in review):
-python -m migrator run <playlist_id>
+# First run: exports Spotify playlists into the DB.
+python -m migrator run
 
-# Or step-by-step:
+# Then match + resolve review rows in the UI:
+python -m migrator match
+python -m migrator serve              # review UI on http://127.0.0.1:8000
+
+# …or skip the UI and take every review match as-is:
+python -m migrator accept
+
+# Subsequent runs: skip the export, push the accepted matches to YTM.
+python -m migrator run                # or `python -m migrator import --yes`
+
+# Single-playlist version (same incremental behavior):
+python -m migrator run <playlist_id>
+```
+
+Or step-by-step if you want full control:
+
+```bash
 python -m migrator export <playlist_id>
 python -m migrator match  <playlist_id>
-python -m migrator serve              # review UI on http://127.0.0.1:8000
+python -m migrator serve              # resolve review rows
 python -m migrator import <playlist_id>
 ```
 
-`export`, `match`, `import`, and `run` all accept an optional `playlist_id` —
+### Accepting review rows without the UI
+
+`match` parks anything it isn't confident about in `review`, and `import`
+ignores those rows. `accept` clears that queue in bulk — it's the CLI
+equivalent of clicking accept on every row in the review UI:
+
+```bash
+python -m migrator accept                      # every playlist
+python -m migrator accept <playlist_id>        # just one
+python -m migrator accept -t 0.8               # only rows scoring ≥ 0.8
+python -m migrator accept --dry-run            # show the counts, write nothing
+python -m migrator accept --yes                # no confirmation prompt
+```
+
+Review rows that matching found *no* candidate for are left alone — there's no
+videoId to import, so accepting them would quietly drop the track. Resolve
+those in the UI (or leave them). There's no un-accept command, so `--dry-run`
+first if you're unsure; re-running `match` re-scores everything from scratch.
+
+`export`, `match`, `accept`, `import`, and `run` all accept an optional `playlist_id` —
 omit it to run the command over every exported playlist:
 
 ```bash
-# Migrate everything (export + match + import across all playlists):
-python -m migrator run
+# Migrate everything in two stages:
+python -m migrator run                # first call: export + import
+# (resolve review rows in the web UI)
+python -m migrator run                # later calls: just import
 
 # Or step-by-step across all playlists:
 python -m migrator export                 # all Spotify playlists → DB
@@ -192,9 +232,42 @@ redirect URI exactly matches `SPOTIFY_REDIRECT_URI` in `.env`. The default is
 `cookie` key. Re-extract from DevTools; the cookie alone is usually several KB
 long and contains `VISITOR_INFO1_LIVE`, `LOGIN_INFO`, `HSID`, `SSID`, etc.
 
-**YTM 429 / rate-limited** — the importer backs off 30 s and retries 3×
-automatically. If it still fails, slow down by lowering
-`MIGRATOR_MATCH_CONCURRENCY` or just re-run `import` later.
+**YTM "session is signed out" — but my browser is still signed in** — this is
+the expected symptom of *stale* headers, not an expired login, and the two are
+easy to confuse. Google rotates part of your session cookie
+(`__Secure-1PSIDTS` / `__Secure-3PSIDTS`, `SIDCC`) every few minutes and hands
+the new values back on each response. Your browser follows that rotation
+automatically; the snapshot in `headers_auth.json` cannot, so it ages out while
+the browser tab stays happily signed in. The importer now reads those rotated
+values off its own responses and writes them back to `headers_auth.json`, so a
+long run keeps itself current. If you do hit this, just re-export your headers
+— nothing is wrong with your account, and the import resumes where it left off.
+
+**YTM 429 / rate-limited** — all three YTM network calls back off and retry
+automatically. Playlist imports (`add_playlist_items`) and playlist creation
+(`create_playlist`) use `[importing] rate_limit_backoff_seconds` / `…_max_retries`
+(30 s × 5, capped at `rate_limit_max_backoff_seconds`); per-track search uses the
+lighter `[matching] search_retry_backoff_seconds` / `…_max_retries`. Retries are
+the safety net — the thing that actually *prevents* throttling is
+`[importing] batch_interval_seconds`, which paces successive batch adds, since
+YouTube limits on the rate of playlist edits. `create_min_interval_seconds` does
+the same for playlist creation, which the anti-abuse limiter otherwise rejects
+as a spurious `401 "You must be signed in"`. If a batch still comes back
+`409 Conflict` after retries, it's split in half and retried down to
+`min_batch_size`. If throttling persists, raise `batch_interval_seconds`, lower
+`MIGRATOR_MATCH_CONCURRENCY`, or re-run later — reruns resume, never duplicate.
+
+**Spotify 429 during export** — bulk export hits
+`/v1/playlists/{id}/items` once per page per playlist and can burst past
+Spotify's per-minute budget. The per-page GET retries **indefinitely**
+(unattended export would rather wait than orphan half a playlist) — it
+honours `Retry-After` (seconds) when Spotify sends one and falls back to
+exponential backoff otherwise, with a per-sleep cap so a runaway backoff
+never stretches past `rate_limit_max_backoff_seconds`. Knobs live under
+`[spotify]` (`rate_limit_backoff_seconds` = 5.0,
+`rate_limit_max_backoff_seconds` = 600 by default). Non-429 4xx still
+surface immediately as `Skipped … HTTP <code>` so genuine errors don't get
+swallowed.
 
 **Region-restricted tracks** — logged and skipped. YTM will silently drop
 them from `add_playlist_items`; check the import summary for the

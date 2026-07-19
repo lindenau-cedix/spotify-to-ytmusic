@@ -21,6 +21,8 @@ dependencies = [
   "sqlmodel==0.0.22",
   "spotipy==2.24.0",
   "ytmusicapi>=1.12.0",
+  # Live browser cookie; see src/migrator/browser_cookies.py.
+  "browser_cookie3>=0.19.1",
   "rich==13.9.4",
   "typer==0.15.1",
   "click>=8.0,<8.2",

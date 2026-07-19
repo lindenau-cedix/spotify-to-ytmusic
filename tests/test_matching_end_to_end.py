@@ -101,3 +101,68 @@ def test_match_many_persists_results(isolated_settings):
     results = asyncio.run(m.match_many(requests))
     assert len(results) == 3
     assert all(r.status == "accepted" for r in results)
+
+
+def test_match_many_serializes_ytm_calls_even_with_high_concurrency(
+    isolated_settings, monkeypatch
+) -> None:
+    """Even with concurrency=8, the actual YTM calls must not overlap — this is
+    what keeps the matcher from tripping YTM's anti-abuse limiter mid-batch.
+    We simulate the overlap window with a threading.Lock held during each call
+    and assert no two calls ever run concurrently."""
+    import threading
+    import time
+
+    fx = load_fixture("perfect_match.json")
+    sp = fx["spotify"]
+    requests = [
+        MatchRequest(
+            spotify_track_id=f"t{i}",
+            title=sp["name"],
+            artists=sp["artists"],
+            duration_ms=sp["duration_ms"],
+            isrc="",  # skip tier 1 so we observe the text-search path
+        )
+        for i in range(8)
+    ]
+    scripted = {f'{sp["name"]} {sp["artists"][0]}': fx["ytm_candidates"]}
+    client = FakeYTMClient(scripted=scripted)
+
+    overlap = {"max_concurrent": 0, "current": 0}
+    overlap_lock = threading.Lock()
+    real_search = client.search_songs
+
+    def tracking_search(query, limit=5):
+        with overlap_lock:
+            overlap["current"] += 1
+            overlap["max_concurrent"] = max(overlap["max_concurrent"], overlap["current"])
+        time.sleep(0.01)  # widen the window so a real overlap would be observable
+        try:
+            return real_search(query, limit)
+        finally:
+            with overlap_lock:
+                overlap["current"] -= 1
+
+    monkeypatch.setattr(client, "search_songs", tracking_search)
+    m = Matcher(client, concurrency=8)
+    asyncio.run(m.match_many(requests))
+
+    assert overlap["max_concurrent"] == 1, (
+        f"YTM calls overlapped (peak={overlap['max_concurrent']}); matcher is "
+        f"still firing concurrent searches despite the lock"
+    )
+
+
+def test_match_one_uses_strict_search_when_configured(isolated_settings) -> None:
+    """strict_search=True must route through search_songs_strict so a throttle
+    is raised instead of silently degrading to []."""
+    fx = load_fixture("perfect_match.json")
+    sp = fx["spotify"]
+    req = _request_from_fixture({**fx["spotify"], "isrc": ""})  # force tier-2
+    scripted = {f'{sp["name"]} {sp["artists"][0]}': fx["ytm_candidates"]}
+    client = FakeYTMClient(scripted=scripted)
+    m = Matcher(client, concurrency=1, strict_search=True)
+    asyncio.run(m.match_one(req))
+    methods = [c[0] for c in client.calls]
+    assert "search_strict" in methods
+    assert "search" not in methods  # strict mode must not fall through silently
